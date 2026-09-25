@@ -62,6 +62,76 @@ class Repository:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.init_schema()
+        self.migrate_schema()
+
+    def _columns(self, table: str) -> set[str]:
+        return {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+
+    def migrate_schema(self) -> None:
+        """Bring databases created by older versions in line with origin tracking."""
+        with self.tx() as conn:
+            case_cols = self._columns("cases")
+            if "merged_at" not in case_cols:
+                conn.execute("ALTER TABLE cases ADD COLUMN merged_at TEXT")
+            for table in ("intakes", "followups", "reports", "medical_reviews"):
+                cols = self._columns(table)
+                if "origin_case_id" not in cols:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN origin_case_id INTEGER REFERENCES cases(id)")
+                    conn.execute(f"UPDATE {table} SET origin_case_id=case_id WHERE origin_case_id IS NULL")
+                if "origin_case_no" not in cols:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN origin_case_no TEXT")
+                    conn.execute(
+                        f"UPDATE {table} SET origin_case_no=(SELECT case_no FROM cases WHERE cases.id={table}.origin_case_id) "
+                        "WHERE origin_case_no IS NULL"
+                    )
+
+        def rebuild(conn: sqlite3.Connection, table: str, create_sql: str, columns: str) -> None:
+            conn.execute(f"ALTER TABLE {table} RENAME TO {table}_old")
+            conn.execute(create_sql)
+            conn.execute(
+                f"INSERT INTO {table}({columns}) SELECT {columns} FROM {table}_old"
+            )
+            conn.execute(f"DROP TABLE {table}_old")
+
+        followup_cols = self._columns("followups")
+        review_cols = self._columns("medical_reviews")
+        needs_followup_rebuild = "origin_case_id" not in followup_cols
+        needs_review_rebuild = "origin_case_id" not in review_cols
+        if needs_followup_rebuild or needs_review_rebuild:
+            with self.tx() as conn:
+                if needs_followup_rebuild:
+                    rebuild(
+                        conn,
+                        "followups",
+                        """CREATE TABLE followups (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            case_id INTEGER NOT NULL REFERENCES cases(id),
+                            origin_case_id INTEGER NOT NULL REFERENCES cases(id),
+                            origin_case_no TEXT,
+                            content TEXT NOT NULL, source TEXT NOT NULL,
+                            received_at TEXT NOT NULL, revision INTEGER NOT NULL,
+                            created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+                            UNIQUE(origin_case_id, revision)
+                        )""",
+                        "id,case_id,origin_case_id,origin_case_no,content,source,received_at,revision,created_by,created_at",
+                    )
+                if needs_review_rebuild:
+                    rebuild(
+                        conn,
+                        "medical_reviews",
+                        """CREATE TABLE medical_reviews (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            case_id INTEGER NOT NULL REFERENCES cases(id),
+                            origin_case_id INTEGER NOT NULL REFERENCES cases(id),
+                            origin_case_no TEXT,
+                            case_revision INTEGER NOT NULL,
+                            serious INTEGER NOT NULL, fatal INTEGER NOT NULL,
+                            causality TEXT NOT NULL, rationale TEXT NOT NULL,
+                            reviewer TEXT NOT NULL, created_at TEXT NOT NULL,
+                            UNIQUE(origin_case_id, case_revision)
+                        )""",
+                        "id,case_id,origin_case_id,origin_case_no,case_revision,serious,fatal,causality,rationale,reviewer,created_at",
+                    )
 
     @contextmanager
     def tx(self):
@@ -92,6 +162,7 @@ class Repository:
                 status TEXT NOT NULL DEFAULT 'open',
                 revision INTEGER NOT NULL DEFAULT 1,
                 merged_into INTEGER REFERENCES cases(id),
+                merged_at TEXT,
                 created_by TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -99,6 +170,7 @@ class Repository:
             CREATE TABLE IF NOT EXISTS intakes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 case_id INTEGER REFERENCES cases(id),
+                origin_case_id INTEGER,
                 source TEXT NOT NULL,
                 dedupe_key TEXT NOT NULL UNIQUE,
                 payload_json TEXT NOT NULL,
@@ -109,17 +181,21 @@ class Repository:
             CREATE TABLE IF NOT EXISTS followups (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 case_id INTEGER NOT NULL REFERENCES cases(id),
+                origin_case_id INTEGER NOT NULL REFERENCES cases(id),
+                origin_case_no TEXT,
                 content TEXT NOT NULL,
                 source TEXT NOT NULL,
                 received_at TEXT NOT NULL,
                 revision INTEGER NOT NULL,
                 created_by TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                UNIQUE(case_id, revision)
+                UNIQUE(origin_case_id, revision)
             );
             CREATE TABLE IF NOT EXISTS reports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 case_id INTEGER NOT NULL REFERENCES cases(id),
+                origin_case_id INTEGER NOT NULL REFERENCES cases(id),
+                origin_case_no TEXT,
                 country TEXT NOT NULL,
                 due_at TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
@@ -131,6 +207,8 @@ class Repository:
             CREATE TABLE IF NOT EXISTS medical_reviews (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 case_id INTEGER NOT NULL REFERENCES cases(id),
+                origin_case_id INTEGER NOT NULL REFERENCES cases(id),
+                origin_case_no TEXT,
                 case_revision INTEGER NOT NULL,
                 serious INTEGER NOT NULL,
                 fatal INTEGER NOT NULL,
@@ -138,7 +216,7 @@ class Repository:
                 rationale TEXT NOT NULL,
                 reviewer TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                UNIQUE(case_id, case_revision)
+                UNIQUE(origin_case_id, case_revision)
             );
             CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -189,6 +267,16 @@ class PharmacovigilanceService:
             raise ApiError(404, "case_not_found", "案例不存在")
         return row
 
+    @staticmethod
+    def _merge_root(conn: sqlite3.Connection, case_row: sqlite3.Row) -> sqlite3.Row:
+        """Follow the merge chain to the surviving target case."""
+        row = case_row
+        seen: set[int] = set()
+        while row["status"] == "merged" and row["merged_into"] and row["id"] not in seen:
+            seen.add(row["id"])
+            row = conn.execute("SELECT * FROM cases WHERE id=?", (row["merged_into"],)).fetchone()
+        return row
+
     def create_case(self, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
         required = ("patient_ref", "region", "product", "event_term", "source", "dedupe_key")
         missing = [key for key in required if not str(body.get(key, "")).strip()]
@@ -224,26 +312,122 @@ class PharmacovigilanceService:
                 raise ApiError(409, "case_number_conflict", "案例编号已存在") from exc
             case_id = cursor.lastrowid
             conn.execute(
-                "INSERT INTO intakes(case_id,source,dedupe_key,payload_json,received_at,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
-                (case_id, body["source"], body["dedupe_key"], json.dumps(body, ensure_ascii=False, sort_keys=True), iso(received), actor, now),
+                "INSERT INTO intakes(case_id,origin_case_id,origin_case_no,source,dedupe_key,payload_json,received_at,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (case_id, case_id, case_no, body["source"], body["dedupe_key"], json.dumps(body, ensure_ascii=False, sort_keys=True), iso(received), actor, now),
             )
             Repository.audit(conn, case_id, actor, role, "case_created", {"case_no": case_no, "source": body["source"]})
             case = self._case(conn, case_id)
             return {"deduplicated": False, "case": dict(case)}
 
     def get_case(self, case_id: int, role: str, region: str) -> dict[str, Any]:
-        case = self._case(self.repo.conn, case_id)
-        if not self.can_access(case, role, region):
+        case_row = self._case(self.repo.conn, case_id)
+        if not self.can_access(case_row, role, region):
             raise ApiError(403, "case_forbidden", "无权查看该区域案例")
         conn = self.repo.conn
-        return {
-            "case": dict(case),
-            "intakes": [dict(r) for r in conn.execute("SELECT id,source,dedupe_key,received_at,created_by,created_at FROM intakes WHERE case_id=? ORDER BY id", (case_id,))],
-            "followups": [dict(r) for r in conn.execute("SELECT * FROM followups WHERE case_id=? ORDER BY revision", (case_id,))],
-            "reports": [dict(r) for r in conn.execute("SELECT * FROM reports WHERE case_id=? ORDER BY country", (case_id,))],
+
+        # 合并来源（含链式合并时的间接来源），按合并时间排列。
+        merge_sources = [
+            {"id": r["id"], "case_no": r["case_no"], "product": r["product"],
+             "region": r["region"], "merged_at": r["merged_at"], "revision": r["revision"],
+             "merged_into": r["merged_into"], "via_case_no": r["via_case_no"],
+             "indirect": bool(r["merged_into"] != case_id)}
+            for r in conn.execute(
+                """WITH RECURSIVE src(id, parent) AS (
+                       SELECT id, merged_into FROM cases WHERE merged_into=? AND status='merged'
+                       UNION ALL
+                       SELECT c.id, c.merged_into FROM cases c JOIN src s ON c.merged_into=s.id AND c.status='merged'
+                   )
+                   SELECT c.id,c.case_no,c.product,c.region,c.merged_at,c.revision,c.merged_into,
+                          (SELECT case_no FROM cases WHERE id=src.parent) AS via_case_no
+                   FROM src JOIN cases c ON c.id=src.id ORDER BY c.merged_at,c.id""",
+                (case_id,),
+            )
+        ]
+        merged_target = None
+        if case_row["status"] == "merged" and case_row["merged_into"]:
+            tgt = self._merge_root(conn, case_row)
+            merged_target = {"id": tgt["id"], "case_no": tgt["case_no"]}
+
+        privileged = role in {"medical_reviewer", "global_admin"}
+        source_ids = [case_id] + [s["id"] for s in merge_sources]
+        placeholders = ",".join("?" for _ in source_ids)
+        audit_rows = [
+            dict(r) for r in conn.execute(
+                f"SELECT actor,role,action,detail_json,created_at,case_id FROM audit_log "
+                f"WHERE case_id IN ({placeholders}) ORDER BY id",
+                source_ids,
+            )
+        ] if privileged else []
+
+        result = {
+            "case": dict(case_row),
+            "merged_target": merged_target,
+            "merge_sources": merge_sources,
+            "intakes": [dict(r) for r in conn.execute("SELECT * FROM intakes WHERE case_id=? ORDER BY id", (case_id,))],
+            "followups": [dict(r) for r in conn.execute("SELECT * FROM followups WHERE case_id=? ORDER BY id", (case_id,))],
+            "reports": [dict(r) for r in conn.execute("SELECT * FROM reports WHERE case_id=? ORDER BY country,id", (case_id,))],
             "reviews": [dict(r) for r in conn.execute("SELECT * FROM medical_reviews WHERE case_id=? ORDER BY id", (case_id,))],
-            "audit": [dict(r) for r in conn.execute("SELECT actor,role,action,detail_json,created_at FROM audit_log WHERE case_id=? ORDER BY id", (case_id,))] if role in {"medical_reviewer", "global_admin"} else [],
+            "audit": audit_rows,
+            "timeline": self._timeline(conn, case_id, source_ids, audit_rows, privileged),
         }
+        return result
+
+    def _timeline(self, conn: sqlite3.Connection, target_id: int, source_ids: list[int],
+                  audit_rows: list[dict[str, Any]], include_audit: bool) -> list[dict[str, Any]]:
+        """Build the merged handling timeline. Every moved entry carries its origin case."""
+        events: list[dict[str, Any]] = []
+        origin_map = {row["id"]: row["case_no"] for row in conn.execute(
+            "SELECT id,case_no FROM cases WHERE id IN (%s)" % ",".join("?" for _ in source_ids), source_ids
+        )}
+        target_no = origin_map.get(target_id)
+
+        def origin_of(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+            origin_id = row["origin_case_id"] if "origin_case_id" in row.keys() else None
+            origin_no = row["origin_case_no"] if "origin_case_no" in row.keys() else None
+            if origin_id is None:
+                origin_id = target_id
+            if not origin_no:
+                origin_no = origin_map.get(origin_id) or target_no
+            return {"origin_case_id": origin_id, "origin_case_no": origin_no,
+                    "moved": origin_id != target_id}
+
+        for r in conn.execute(
+            f"SELECT * FROM intakes WHERE case_id=? ORDER BY received_at,id", (target_id,)
+        ):
+            events.append({"type": "intake", "at": r["received_at"], "source": r["source"],
+                           "dedupe_key": r["dedupe_key"], "created_by": r["created_by"], **origin_of(r)})
+        for r in conn.execute("SELECT * FROM followups WHERE case_id=? ORDER BY received_at,id", (target_id,)):
+            events.append({"type": "followup", "at": r["received_at"], "revision": r["revision"],
+                           "content": r["content"], "source": r["source"], "created_by": r["created_by"],
+                           **origin_of(r)})
+        for r in conn.execute("SELECT * FROM medical_reviews WHERE case_id=? ORDER BY created_at,id", (target_id,)):
+            events.append({"type": "medical_review", "at": r["created_at"], "case_revision": r["case_revision"],
+                           "serious": bool(r["serious"]), "fatal": bool(r["fatal"]),
+                           "causality": r["causality"], "rationale": r["rationale"], "reviewer": r["reviewer"],
+                           **origin_of(r)})
+        for r in conn.execute("SELECT * FROM reports WHERE case_id=? ORDER BY due_at,id", (target_id,)):
+            base = origin_of(r)
+            events.append({"type": "report_due", "at": r["due_at"], "country": r["country"],
+                           "report_id": r["id"], **base})
+            if r["status"] == "submitted" and r["submitted_at"]:
+                events.append({"type": "report_submitted", "at": r["submitted_at"], "country": r["country"],
+                               "report_id": r["id"], "late": bool(r["late"]),
+                               "submitted_by": r["submitted_by"], **base})
+
+        if include_audit:
+            for row in audit_rows:
+                origin_id = row["case_id"]
+                events.append({
+                    "type": "audit", "at": row["created_at"], "action": row["action"],
+                    "actor": row["actor"], "role": row["role"],
+                    "detail": json.loads(row["detail_json"]),
+                    "origin_case_id": origin_id,
+                    "origin_case_no": origin_map.get(origin_id) or target_no,
+                    "moved": origin_id != target_id,
+                })
+
+        events.sort(key=lambda e: (e["at"] or "", e["type"]))
+        return events
 
     def list_cases(self, role: str, region: str, query: dict[str, list[str]]) -> list[dict[str, Any]]:
         sql = "SELECT * FROM cases WHERE status!='merged'"
@@ -277,8 +461,8 @@ class PharmacovigilanceService:
             received = parse_time(body.get("received_at"), utcnow())
             due = report_deadline(received, bool(case["serious"]), bool(case["fatal"]))
             conn.execute(
-                "INSERT INTO followups(case_id,content,source,received_at,revision,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
-                (case_id, content, source, iso(received), revision, actor, iso()),
+                "INSERT INTO followups(case_id,origin_case_id,origin_case_no,content,source,received_at,revision,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (case_id, case_id, case["case_no"], content, source, iso(received), revision, actor, iso()),
             )
             conn.execute(
                 "UPDATE cases SET revision=?,received_at=?,report_due_at=?,updated_at=? WHERE id=?",
@@ -315,9 +499,9 @@ class PharmacovigilanceService:
                 (int(serious), int(fatal), causality, iso(due), revision, iso(), case_id),
             )
             conn.execute(
-                """INSERT INTO medical_reviews(case_id,case_revision,serious,fatal,causality,rationale,reviewer,created_at)
-                   VALUES(?,?,?,?,?,?,?,?)""",
-                (case_id, expected, int(serious), int(fatal), causality, rationale, actor, iso()),
+                """INSERT INTO medical_reviews(case_id,origin_case_id,origin_case_no,case_revision,serious,fatal,causality,rationale,reviewer,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (case_id, case_id, case["case_no"], expected, int(serious), int(fatal), causality, rationale, actor, iso()),
             )
             Repository.audit(conn, case_id, actor, role, "medical_reviewed", {"from_revision": expected, "serious": serious, "fatal": fatal, "causality": causality})
             return {"case": dict(self._case(conn, case_id)), "reviewed_revision": expected}
@@ -332,9 +516,14 @@ class PharmacovigilanceService:
             case = self._case(conn, case_id)
             if not self.can_access(case, role, region):
                 raise ApiError(403, "region_forbidden", "不能为本区域之外案例生成报告")
+            if case["status"] == "merged":
+                raise ApiError(409, "case_merged", "已合并案例不能再生成报告")
             due = report_deadline(parse_time(case["received_at"]), bool(case["serious"]), bool(case["fatal"]))
             try:
-                cur = conn.execute("INSERT INTO reports(case_id,country,due_at,status) VALUES(?,?,?,?)", (case_id, country, iso(due), "pending"))
+                cur = conn.execute(
+                    "INSERT INTO reports(case_id,origin_case_id,origin_case_no,country,due_at,status) VALUES(?,?,?,?,?,?)",
+                    (case_id, case_id, case["case_no"], country, iso(due), "pending"),
+                )
             except sqlite3.IntegrityError as exc:
                 raise ApiError(409, "report_exists", "该国家报告已经存在") from exc
             Repository.audit(conn, case_id, actor, role, "report_created", {"report_id": cur.lastrowid, "country": country})
@@ -344,11 +533,13 @@ class PharmacovigilanceService:
         if role not in {"regional_lead", "global_admin"}:
             raise ApiError(403, "submit_forbidden", "当前角色不能提交监管报告")
         with self.repo.tx() as conn:
-            row = conn.execute("SELECT r.*,c.region FROM reports r JOIN cases c ON c.id=r.case_id WHERE r.id=?", (report_id,)).fetchone()
+            row = conn.execute("SELECT r.*,c.region,c.status AS case_status FROM reports r JOIN cases c ON c.id=r.case_id WHERE r.id=?", (report_id,)).fetchone()
             if not row:
                 raise ApiError(404, "report_not_found", "报告不存在")
             if not self.can_access(dict(row), role, region):
                 raise ApiError(403, "region_forbidden", "无权提交其他区域报告")
+            if row["case_status"] == "merged":
+                raise ApiError(409, "case_merged", "已合并案例不能再提交报告")
             if row["status"] == "submitted":
                 return {"report": dict(row), "idempotent": True}
             now = parse_time(body.get("submitted_at"), utcnow())
@@ -367,14 +558,71 @@ class PharmacovigilanceService:
             source = self._case(conn, source_id)
             target = self._case(conn, target_id)
             if source["status"] == "merged":
-                return {"case": dict(source), "idempotent": True}
+                target_case = self._merge_root(conn, source)
+                return {"case": dict(target_case), "source_case": dict(source), "idempotent": True,
+                        "moved": {"followups": 0, "medical_reviews": 0, "reports": 0, "discarded_reports": []}}
             if target["status"] == "merged" or source["product"].casefold() != target["product"].casefold():
                 raise ApiError(409, "merge_conflict", "目标案例不可用，或产品与来源案例不一致")
-            conn.execute("UPDATE cases SET status='merged',merged_into=?,revision=revision+1,updated_at=? WHERE id=?", (target_id, iso(), source_id))
+            now = iso()
+
+            # 1. 接入记录直接随案例迁移；随访和医学审核整体迁移，逐条标注原案例编号。
             conn.execute("UPDATE intakes SET case_id=? WHERE case_id=?", (target_id, source_id))
-            Repository.audit(conn, target_id, actor, role, "case_merged_in", {"source_case_id": source_id})
-            Repository.audit(conn, source_id, actor, role, "case_merged_into", {"target_case_id": target_id})
-            return {"case": dict(self._case(conn, source_id)), "idempotent": False}
+            followup_count = conn.execute(
+                "UPDATE followups SET case_id=? WHERE case_id=?", (target_id, source_id)
+            ).rowcount
+            review_count = conn.execute(
+                "UPDATE medical_reviews SET case_id=? WHERE case_id=?", (target_id, source_id)
+            ).rowcount
+
+            # 2. 同国家报告：一份已提交、一份待提交时保留已提交的；两份都待提交时保留截止更早的。
+            target_reports = conn.execute("SELECT * FROM reports WHERE case_id=?", (target_id,)).fetchall()
+            source_reports = conn.execute("SELECT * FROM reports WHERE case_id=?", (source_id,)).fetchall()
+            target_by_country = {r["country"]: r for r in target_reports}
+            moved_reports = 0
+            discarded: list[dict[str, Any]] = []
+            for src in source_reports:
+                keep = src
+                drop = None
+                tgt = target_by_country.get(src["country"])
+                if tgt is not None:
+                    src_submitted = src["status"] == "submitted"
+                    tgt_submitted = tgt["status"] == "submitted"
+                    if src_submitted and not tgt_submitted:
+                        keep, drop = src, tgt
+                    elif tgt_submitted and not src_submitted:
+                        keep, drop = tgt, src
+                    elif src_submitted and tgt_submitted:
+                        # 两份都已提交：保留较早提交的一份，另一份仅作冗余丢弃。
+                        keep, drop = (src, tgt) if src["submitted_at"] <= tgt["submitted_at"] else (tgt, src)
+                    else:
+                        # 两份都待提交（含逾期）：保留截止更早的一份。
+                        keep, drop = (src, tgt) if src["due_at"] <= tgt["due_at"] else (tgt, src)
+                if drop is not None:
+                    discarded.append({"report_id": drop["id"], "country": drop["country"],
+                                      "status": drop["status"], "due_at": drop["due_at"],
+                                      "reason": "submitted_kept" if keep["status"] == "submitted" else "earlier_due_kept"})
+                    conn.execute("DELETE FROM reports WHERE id=?", (drop["id"],))
+                if keep is src:
+                    conn.execute("UPDATE reports SET case_id=? WHERE id=?", (target_id, src["id"]))
+                    target_by_country[src["country"]] = src
+                    moved_reports += 1
+
+            # 3. 原案例退出列表（status=merged），此后不能再更新。
+            conn.execute(
+                "UPDATE cases SET status='merged',merged_into=?,merged_at=?,revision=revision+1,updated_at=? WHERE id=?",
+                (target_id, now, now, source_id),
+            )
+            conn.execute("UPDATE cases SET revision=revision+1,updated_at=? WHERE id=?", (now, target_id))
+            Repository.audit(conn, target_id, actor, role, "case_merged_in",
+                             {"source_case_id": source_id, "source_case_no": source["case_no"],
+                              "moved_followups": followup_count, "moved_medical_reviews": review_count,
+                              "moved_reports": moved_reports, "discarded_reports": discarded})
+            Repository.audit(conn, source_id, actor, role, "case_merged_into",
+                             {"target_case_id": target_id, "target_case_no": target["case_no"]})
+            return {"case": dict(self._case(conn, target_id)), "source_case": dict(self._case(conn, source_id)),
+                    "idempotent": False,
+                    "moved": {"followups": followup_count, "medical_reviews": review_count,
+                              "reports": moved_reports, "discarded_reports": discarded}}
 
     def overdue(self, role: str, region: str) -> list[dict[str, Any]]:
         sql = "SELECT * FROM reports WHERE status!='submitted' AND due_at < ?"
