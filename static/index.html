@@ -1,5 +1,158 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>药物警戒案例台</title>
-<style>body{font:15px system-ui;max-width:1080px;margin:40px auto;padding:0 20px;background:#f5f7fa;color:#172033}section{background:white;padding:20px;margin:16px 0;border-radius:12px;box-shadow:0 2px 12px #0001}input,textarea,button{font:inherit;padding:8px;margin:4px}input,textarea{width:70%}button{background:#174ea6;color:white;border:0;border-radius:6px}pre{background:#111827;color:#d1fae5;padding:14px;overflow:auto}</style>
-<h1>药物警戒案例台</h1><p>标准库 JSON API 概览。请求需带 X-User-Id、X-Role；区域角色还需 X-Region。</p>
-<section><h2>快速查看</h2><input id="user" value="global-admin"><input id="role" value="global_admin"><button onclick="load()">刷新案例</button><pre id="out"></pre></section>
-<script>async function load(){let h={'X-User-Id':user.value,'X-Role':role.value};let r=await fetch('/api/state',{headers:h});out.textContent=JSON.stringify(await r.json(),null,2)}load()</script>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>药物警戒案例台</title>
+<style>
+body{font:15px system-ui,sans-serif;max-width:1080px;margin:32px auto;padding:0 20px;background:#f5f7fa;color:#172033}
+h1{margin-bottom:4px}.muted{color:#5b6675;font-size:13px}
+section{background:#fff;padding:18px 20px;margin:16px 0;border-radius:12px;box-shadow:0 2px 12px #0001}
+input,button,select{font:inherit;padding:7px 10px;margin:3px;border:1px solid #c7d0dd;border-radius:6px}
+input{width:130px}button{background:#174ea6;color:#fff;border:0;cursor:pointer}
+button.ghost{background:#eef2f8;color:#174ea6}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{border-bottom:1px solid #e7ebf1;padding:7px 9px;text-align:left;vertical-align:top}
+th{background:#f2f5fa}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;background:#e3edff;color:#174ea6;margin-left:6px;white-space:nowrap}
+.tag.origin{background:#fdeecf;color:#8a5600}
+.tag.merged{background:#fde2e1;color:#a3231d}
+.tag.submitted{background:#dcf5e3;color:#176b34}
+.tag.pending{background:#f0f1f4;color:#444d5c}
+.timeline{list-style:none;padding:0;margin:0;border-left:3px solid #d7e3f7}
+.timeline li{position:relative;padding:8px 0 8px 20px}
+.timeline li::before{content:"";position:absolute;left:-7px;top:14px;width:10px;height:10px;border-radius:50%;background:#174ea6;border:2px solid #fff}
+.tl-time{color:#5b6675;font-size:12px;margin-right:8px}
+.tl-type{font-weight:600;margin-right:6px}
+.tl-detail{color:#33405c;font-size:13px}
+.banner{background:#fde2e1;border:1px solid #f3b4af;color:#8c1f1a;padding:10px 14px;border-radius:8px;margin-bottom:12px}
+.src-chip{display:inline-block;background:#fdeecf;color:#8a5600;border-radius:8px;padding:4px 10px;margin:3px;font-size:13px}
+#msg{margin:8px 0;font-size:13px;color:#a3231d;white-space:pre-wrap}
+h2,h3{margin:6px 0 12px}
+</style>
+<h1>药物警戒案例台</h1>
+<p class="muted">标准库 JSON API 概览。请求需带 X-User-Id、X-Role；区域角色还需 X-Region。合并后案例详情含合并来源与统一处置时间线。</p>
+<section>
+  <h2>身份与案例列表</h2>
+  <input id="user" value="global-admin">
+  <select id="role">
+    <option value="global_admin" selected>global_admin</option>
+    <option value="regional_lead">regional_lead</option>
+    <option value="medical_reviewer">medical_reviewer</option>
+    <option value="reporter">reporter</option>
+  </select>
+  <input id="region" placeholder="X-Region（如 CN）">
+  <button onclick="loadState()">刷新案例</button>
+  <span id="msg"></span>
+  <table id="cases"><thead><tr><th>编号</th><th>产品</th><th>区域</th><th>状态</th><th>接收时间</th><th></th></tr></thead><tbody></tbody></table>
+</section>
+<section id="detail" hidden>
+  <h2 id="d-title"></h2>
+  <div id="d-merged"></div>
+  <div id="d-sources"></div>
+  <div id="d-mergebox"></div>
+  <h3>合并后的处置时间线</h3>
+  <ul class="timeline" id="d-timeline"></ul>
+  <h3>随访</h3><table id="d-followups"></table>
+  <h3>医学审核</h3><table id="d-reviews"></table>
+  <h3>分国家报告</h3><table id="d-reports"></table>
+  <h3>接入记录</h3><table id="d-intakes"></table>
+</section>
+
+<script>
+const $=id=>document.getElementById(id);
+function headers(){
+  const h={'X-User-Id':$('user').value.trim(),'X-Role':$('role').value};
+  if($('region').value.trim())h['X-Region']=$('region').value.trim();
+  return h;
+}
+function esc(v){return String(v??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function shortTime(t){return esc(t?t.replace('T',' ').replace('Z',' UTC'):'—');}
+function originTag(o){return o?` <span class="tag origin" title="记录来自原案例 ${esc(o)}">原案例 ${esc(o)}</span>`:'';}
+function statusTag(s){
+  const cls=s==='submitted'?'submitted':(s==='merged'?'merged':'pending');
+  return `<span class="tag ${cls}">${esc(s)}</span>`;
+}
+async function api(path,opts){
+  const r=await fetch(path,Object.assign({headers:headers()},opts));
+  const data=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error(data.message||data.error||('HTTP '+r.status));
+  return data;
+}
+async function loadState(){
+  $('msg').textContent='';
+  try{
+    const data=await api('/api/state');
+    const tb=$('cases').querySelector('tbody');
+    tb.innerHTML=(data.cases||[]).map(c=>`<tr>
+      <td>${esc(c.case_no)}</td><td>${esc(c.product)}</td><td>${esc(c.region)}</td>
+      <td>${statusTag(c.status)}</td><td>${shortTime(c.received_at)}</td>
+      <td><button class="ghost" onclick="loadCase(${c.id})">查看详情</button></td></tr>`).join('')
+      || '<tr><td colspan="6" class="muted">暂无未合并案例（已合并案例不在列表中）</td></tr>';
+  }catch(e){$('msg').textContent=e.message;}
+}
+function table(headers_,rows){
+  if(!rows.length)return '<p class="muted">无</p>';
+  return `<table><thead><tr>${headers_.map(h=>`<th>${h}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table>`;
+}
+async function loadCase(id){
+  $('msg').textContent='';
+  try{
+    const d=await api('/api/cases/'+id);
+    $('detail').hidden=false;
+    $('d-title').innerHTML=`案例 ${esc(d.case.case_no)}${statusTag(d.case.status)}
+      <span class="muted">产品 ${esc(d.case.product)} · 区域 ${esc(d.case.region)} · 修订 v${d.case.revision}</span>`;
+
+    $('d-merged').innerHTML=d.case.status==='merged'
+      ?`<div class="banner">该案例已退出处理列表且不能再更新，已并入案例 #${d.case.merged_into}。
+         <button class="ghost" onclick="loadCase(${d.case.merged_into})">查看目标案例</button></div>`:'';
+
+    $('d-sources').innerHTML=d.merged_sources.length
+      ?`<h3>合并来源（${d.merged_sources.length}）</h3><div>`+
+        d.merged_sources.map(s=>`<span class="src-chip">${esc(s.case_no)}（${esc(s.region)}）· 合并于 ${shortTime(s.merged_at)}
+          <button class="ghost" style="padding:1px 6px" onclick="loadCase(${s.id})">查看原案例</button></span>`).join('')+'</div>':'';
+
+    $('d-mergebox').innerHTML=($('role').value==='global_admin'&&d.case.status!=='merged')
+      ?`<h3>合并同产品案例</h3><input id="target-id" type="number" placeholder="目标案例 ID（保留方）">
+        <button onclick="doMerge(${d.case.id})">把本案例合并进目标</button>
+        <span class="muted">随访、医学审核、分国家报告会迁入目标并标注本案例编号；同国家已提交报告优先，均待提交保留截止更早者。</span>`:'';
+
+    const typeLabel={case_created:'录入',followup:'随访',medical_review:'医学审核',
+      report_submitted:'报告已提交',report_due:'报告截止',case_merged:'合并'};
+    $('d-timeline').innerHTML=d.timeline.map(e=>`<li>
+        <span class="tl-time">${shortTime(e.at)}</span><span class="tl-type">${typeLabel[e.type]||e.type}</span>
+        ${esc(e.title)}${originTag(e.origin_case_no)}
+        ${e.detail?`<div class="tl-detail">${esc(e.detail)}${e.by?` · ${esc(e.by)}`:''}</div>`:''}
+      </li>`).join('');
+
+    $('d-followups').outerHTML = `<table id="d-followups">${table(
+      ['修订','内容','来源','随访接收时间','录入人','原案例'],
+      d.followups.map(f=>`<tr><td>${f.revision}</td><td>${esc(f.content)}</td><td>${esc(f.source)}</td>
+        <td>${shortTime(f.received_at)}</td><td>${esc(f.created_by)}</td><td>${esc(f.origin_case_no||'')}</td></tr>`))}</table>`;
+    $('d-reviews').outerHTML = `<table id="d-reviews">${table(
+      ['原修订','严重','死亡','关联性','依据','审核员','时间','原案例'],
+      d.reviews.map(r=>`<tr><td>${r.case_revision}</td><td>${r.serious?'是':'否'}</td><td>${r.fatal?'是':'否'}</td>
+        <td>${esc(r.causality)}</td><td>${esc(r.rationale)}</td><td>${esc(r.reviewer)}</td>
+        <td>${shortTime(r.created_at)}</td><td>${esc(r.origin_case_no||'')}</td></tr>`))}</table>`;
+    $('d-reports').outerHTML = `<table id="d-reports">${table(
+      ['国家','状态','截止','提交时间','提交人','逾期','原案例'],
+      d.reports.map(r=>`<tr><td>${esc(r.country)}</td><td>${statusTag(r.status)}</td><td>${shortTime(r.due_at)}</td>
+        <td>${shortTime(r.submitted_at)}</td><td>${esc(r.submitted_by||'')}</td>
+        <td>${r.late?'是':''}</td><td>${esc(r.origin_case_no||'')}</td></tr>`))}</table>`;
+    $('d-intakes').outerHTML = `<table id="d-intakes">${table(
+      ['渠道','去重键','接收时间','录入人'],
+      d.intakes.map(i=>`<tr><td>${esc(i.source)}</td><td>${esc(i.dedupe_key)}</td>
+        <td>${shortTime(i.received_at)}</td><td>${esc(i.created_by)}</td></tr>`))}</table>`;
+    $('detail').scrollIntoView({behavior:'smooth'});
+  }catch(e){$('msg').textContent=e.message;}
+}
+async function doMerge(sourceId){
+  const targetId=parseInt($('target-id').value,10);
+  if(!targetId){$('msg').textContent='请填写目标案例 ID';return;}
+  $('msg').textContent='';
+  try{
+    const r=await api(`/api/cases/${sourceId}/merge`,{method:'POST',body:JSON.stringify({target_case_id:targetId})});
+    if(r.idempotent){$('msg').textContent='该案例此前已合并';}
+    else{$('msg').textContent=`合并完成：迁移随访 ${r.moved.followups} 条、医学审核 ${r.moved.reviews} 条、报告 ${r.moved.reports} 条，同国家冲突舍弃 ${r.reports_dropped} 条`;}
+    await loadState();
+    loadCase(r.target_case_id||targetId);
+  }catch(e){$('msg').textContent=e.message;}
+}
+loadState();
+</script>

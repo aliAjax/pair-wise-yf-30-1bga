@@ -21,7 +21,8 @@ python3 app.py --db pharmacovigilance.db
 - `POST /api/cases/{id}/followups`：用 `expected_revision` 防止覆盖随访。
 - `POST /api/cases/{id}/medical-review`：医学审核员更新严重性、死亡和关联性。
 - `POST /api/cases/{id}/reports`、`POST /api/reports/{id}/submit`：生成并提交分国家报告。
-- `POST /api/cases/{id}/merge`：全局管理员合并重复案例。
+- `POST /api/cases/{id}/merge`：仅全局管理员，且来源与目标须为同产品。合并时把来源案例的随访、医学审核、分国家报告全部迁入目标案例，每条记录以 `origin_case_no` 标注原案例编号（链式合并保留最初来源）。同国家报告冲突时：一侧已提交、一侧待提交保留已提交方；两侧都待提交保留截止更早方（两侧均已提交则保留提交更早方），时间完全相同保留目标方。来源案例置为 `merged`：退出案例列表且随访、审核、报告均不可再更新。
+- `GET /api/cases/{id}`：返回 `merged_sources`（递归的合并来源列表与各自合并时间）和 `timeline`（目标案例合并后的统一处置时间线，迁移记录带原案例编号）。
 - `POST /api/escalate-overdue`、`GET /api/overdue`：逾期检查与升级。
 
 ## 测试
